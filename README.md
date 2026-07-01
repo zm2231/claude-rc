@@ -22,9 +22,17 @@ Required:
 
 - macOS
 - Chrome logged in to `https://claude.ai`
-- Claude Code sessions with Remote Control enabled
+- Claude Code sessions with Remote Control enabled by default
 - `python3`
 - `node` and `npm`
+
+Before using this, open Claude Code, run `/config`, and set:
+
+```text
+Enable Remote Control for all sessions    true
+```
+
+Claude Code defaults this to `false`. `claude-rc` assumes sessions are RC-enabled, so this is the difference between "works everywhere" and "why is this one session invisible?"
 
 Installed dependencies:
 
