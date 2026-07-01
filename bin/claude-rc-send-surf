@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Legacy surf UI sender. Optional fallback only; the primary client is rc.py.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  claude-rc-send --via-surf <target> <message>
+  claude-rc-send --via-surf --resolve <target>
+
+Targets can be an RC session id, RC URL, PID, local session id/prefix, or
+case-insensitive fragment of cwd/name. Requires `surf` on PATH.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -lt 2 ]]; then
+  if [[ "${1:-}" == "--resolve" && $# -eq 2 ]]; then
+    :
+  else
+    usage
+    exit 0
+  fi
+fi
+
+resolve_only=false
+if [[ "${1:-}" == "--resolve" ]]; then
+  resolve_only=true
+  target="$2"
+  message=""
+else
+  target="$1"
+  shift
+  message="$*"
+fi
+
+sessions_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions"
+
+if [[ "$resolve_only" == false && -z "$message" ]]; then
+  echo "error: message is empty" >&2
+  exit 2
+fi
+
+if [[ "$resolve_only" == false ]] && ! command -v surf >/dev/null 2>&1; then
+  echo "error: surf is not on PATH" >&2
+  exit 127
+fi
+
+resolve_target() {
+  local raw="$1"
+
+  if [[ "$raw" == https://claude.ai/code/* ]]; then
+    printf '%s\n' "$raw"
+    return 0
+  fi
+
+  if [[ "$raw" == session_* ]]; then
+    printf 'https://claude.ai/code/%s\n' "$raw"
+    return 0
+  fi
+
+  if [[ ! -d "$sessions_dir" ]]; then
+    echo "error: no Claude sessions dir found: $sessions_dir" >&2
+    return 1
+  fi
+
+  local matches
+  matches="$(
+    jq -r --arg q "$raw" '
+      def s: tostring;
+      select(.bridgeSessionId != null)
+      | select(
+          ((.pid | s) == $q)
+          or (.sessionId | startswith($q))
+          or (.bridgeSessionId | startswith($q))
+          or ((.cwd // "") | ascii_downcase | contains($q | ascii_downcase))
+          or ((.name // "") | ascii_downcase | contains($q | ascii_downcase))
+        )
+      | [.bridgeSessionId, (.pid | s), .sessionId, (.cwd // ""), (.name // "")] | @tsv
+    ' "$sessions_dir"/*.json 2>/dev/null
+  )"
+
+  local count
+  count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [[ "$count" == "0" ]]; then
+    echo "error: no RC-enabled Claude session matched '$raw'" >&2
+    echo "hint: run claude-rc-list" >&2
+    return 1
+  fi
+  if [[ "$count" != "1" ]]; then
+    echo "error: target '$raw' matched multiple RC sessions:" >&2
+    printf '%s\n' "$matches" >&2
+    echo "hint: use PID, local session prefix, or full session_* id" >&2
+    return 1
+  fi
+
+  local bridge_id
+  bridge_id="$(printf '%s\n' "$matches" | cut -f1)"
+  printf 'https://claude.ai/code/%s\n' "$bridge_id"
+}
+
+url="$(resolve_target "$target")"
+
+if [[ "$resolve_only" == true ]]; then
+  printf '%s\n' "$url"
+  exit 0
+fi
+
+surf navigate "$url" >/dev/null
+sleep 1
+surf click --selector '[aria-label="Prompt"]' >/dev/null
+surf type "$message" >/dev/null
+sleep 0.2
+surf click --selector 'button[aria-label="Send"]:not([disabled])' >/dev/null
+
+echo "sent via RC UI: $url"

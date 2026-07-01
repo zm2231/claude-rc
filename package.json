@@ -1,0 +1,17 @@
+{
+  "name": "claude-rc",
+  "version": "1.0.0",
+  "description": "Headless Claude Code Remote Control client",
+  "main": "index.js",
+  "scripts": {
+    "doctor": "bin/claude-rc-send doctor",
+    "list": "bin/claude-rc-list"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@steipete/sweet-cookie": "^0.4.0"
+  }
+}

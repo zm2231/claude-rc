@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# claude-rc-send — headless Claude Code Remote-Control client.
+#
+# Default: python backend (curl_cffi for Cloudflare-safe TLS, cookie read via
+# @steipete/sweet-cookie). Fully browser-free: send, watch, ack, stream, doctor.
+#
+# Backends (set RC_SEND_BACKEND or pass --via-<name>):
+#   python  (default) — headless HTTP + TLS impersonation.
+#   node            — headless HTTP (events POST only; watch/list get CF-blocked).
+#   surf            — optional browser UI fallback for send.
+
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd -P -- "$(dirname -- "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "$SOURCE")" && pwd)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+RC_NATIVE="${RC_NATIVE:-$PROJECT_ROOT}"
+if [[ -z "${RC_PY:-}" ]]; then
+  if [[ -x "$PROJECT_ROOT/.venv/bin/python3" ]]; then
+    RC_PY="$PROJECT_ROOT/.venv/bin/python3"
+  else
+    RC_PY="python3"
+  fi
+fi
+SURF_FALLBACK="${SURF_FALLBACK:-$PROJECT_ROOT/bin/claude-rc-send-surf}"
+NODE_SEND="${RC_NATIVE}/send.mjs"
+
+backend="${RC_SEND_BACKEND:-python}"
+auto_fallback="${RC_AUTO_FALLBACK:-1}"
+if [[ "${1:-}" == "--via-node" ]]; then backend="node"; shift; fi
+if [[ "${1:-}" == "--via-python" ]]; then backend="python"; shift; fi
+if [[ "${1:-}" == "--via-surf" ]]; then backend="surf"; auto_fallback=0; shift; fi
+if [[ "${1:-}" == --via-* ]]; then
+  echo "error: unsupported backend flag '${1:-}' (use --via-python, --via-node, or --via-surf)" >&2
+  exit 2
+fi
+
+usage() {
+  "$RC_PY" -W ignore::UserWarning "$RC_NATIVE/rc.py" --help
+}
+
+is_subcommand() {
+  case "$1" in
+    list|resolve|send|send+watch|watch|stream|doctor|last-reply) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Normalize the historical launcher syntax into rc.py's subcommand syntax.
+# Old:
+#   claude-rc-send <target> <message>
+#   claude-rc-send --resolve <target>
+# New:
+#   claude-rc-send send <target> <message>
+#   claude-rc-send resolve <target>
+normalized_args=()
+if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+elif [[ "${1:-}" == "--resolve" ]]; then
+  shift
+  normalized_args=(resolve "$@")
+elif [[ "${1:-}" == "--list" ]]; then
+  shift
+  normalized_args=(list "$@")
+elif is_subcommand "${1:-}"; then
+  normalized_args=("$@")
+else
+  normalized_args=(send "$@")
+fi
+
+cmd="${normalized_args[0]}"
+read_only=0
+case "$cmd" in
+  list|resolve|doctor|last-reply) read_only=1 ;;
+esac
+
+run_python() {
+  "$RC_PY" -W ignore::UserWarning "$RC_NATIVE/rc.py" "$@" 2> \
+    >(grep -v -E 'logfire-plugin|LogData|opentelemetry|plugins = get_plugins' >&2)
+}
+
+run_surf() {
+  local args=("$@")
+  if [[ "${args[0]:-}" == "send" ]]; then
+    args=("${args[@]:1}")
+  elif [[ "${args[0]:-}" == "resolve" ]]; then
+    args=(--resolve "${args[@]:1}")
+  fi
+  "$SURF_FALLBACK" "${args[@]}"
+}
+
+case "$backend" in
+  surf)
+    case "$cmd" in
+      send|resolve) run_surf "${normalized_args[@]}" ;;
+      *)
+        echo "error: surf backend only supports send and resolve; use python for '$cmd'" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  node)
+    case "$cmd" in
+      list) exec node "$NODE_SEND" --list "${normalized_args[@]:1}" ;;
+      resolve) exec node "$NODE_SEND" --resolve "${normalized_args[@]:1}" ;;
+      send) exec node "$NODE_SEND" "${normalized_args[@]:1}" ;;
+      *)
+        echo "error: node backend only supports list, resolve, and send; use python for '$cmd'" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  python)
+    streaming=0
+    for a in "${normalized_args[@]}"; do [[ "$a" == "--stream" || "$a" == stream || "$a" == watch || "$a" == send+watch ]] && streaming=1; done
+    if [[ "$read_only" == 1 || "$auto_fallback" != "1" || "$streaming" == 1 ]]; then
+      exec "$RC_PY" -W ignore::UserWarning "$RC_NATIVE/rc.py" "${normalized_args[@]}" 2> \
+        >(grep -v -E 'logfire-plugin|LogData|opentelemetry|plugins = get_plugins' >&2)
+    fi
+    set +e
+    out=$(run_python "${normalized_args[@]}" 2>&1)
+    status=$?
+    set -e
+    if echo "$out" | grep -qiE 'Cloudflare challenge|cf_clearance'; then
+      echo "claude-rc: python backend hit Cloudflare; falling back to surf UI sender" >&2
+      run_surf "${normalized_args[@]}"
+    else
+      [[ -n "$out" ]] && echo "$out"
+      exit "$status"
+    fi
+    ;;
+  *)
+    echo "error: unknown backend '$backend' (use python|node|surf)" >&2
+    exit 2
+    ;;
+esac

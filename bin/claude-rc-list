@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# claude-rc-list — list RC-enabled Claude Code sessions.
+# Delegates to the headless client. Backends: python (default), node.
+set -euo pipefail
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd -P -- "$(dirname -- "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "$SOURCE")" && pwd)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+RC_NATIVE="${RC_NATIVE:-$PROJECT_ROOT}"
+if [[ -z "${RC_PY:-}" ]]; then
+  if [[ -x "$PROJECT_ROOT/.venv/bin/python3" ]]; then
+    RC_PY="$PROJECT_ROOT/.venv/bin/python3"
+  else
+    RC_PY="python3"
+  fi
+fi
+backend="${RC_LIST_BACKEND:-python}"
+[[ "${1:-}" == "--via-node" ]] && { backend="node"; shift; }
+if [[ "${1:-}" == --via-* ]]; then
+  echo "error: unsupported backend flag '${1:-}' (use --via-python or --via-node)" >&2
+  exit 2
+fi
+case "$backend" in
+  python) exec "$RC_PY" "$RC_NATIVE/rc.py" list "$@" ;;
+  node) exec node "$RC_NATIVE/send.mjs" --list "$@" ;;
+  *)
+    echo "error: unknown backend '$backend' (use python|node)" >&2
+    exit 2
+    ;;
+esac
