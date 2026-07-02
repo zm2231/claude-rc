@@ -107,6 +107,13 @@ Targets can be:
 
 If a target is ambiguous, the command fails and prints the matching sessions.
 
+`resolve --json` also reports routing metadata:
+
+- `hasLocalTranscript`: whether this machine has the Claude JSONL transcript.
+- `replySource`: `transcript` for local-first replies, otherwise `api`.
+- `streamSource`: `transcript` for local streaming, otherwise `watch`.
+- `remoteOnly`: true when this client cannot read a local transcript for the target.
+
 ## Commands
 
 ```bash
@@ -115,7 +122,7 @@ claude-rc-send list [--json]
 claude-rc-send resolve <target> [--json]
 claude-rc-send send <target> "message" [--wait-ack [regex]] [--reply] [--stream] [--json]
 claude-rc-send send+watch <target> "message" [--wait-ack [regex]]
-claude-rc-send last-reply <target> [--limit N] [--json]
+claude-rc-send last-reply <target> [--source auto|local|api] [--limit N] [--json]
 claude-rc-send stream <target>
 claude-rc-send watch [target]
 claude-rc-send doctor [--json]
@@ -169,9 +176,13 @@ It supports send and resolve only. It exists for the case where Cloudflare makes
 
 `claude-rc` talks to Claude Code Remote Control. It does not inject into arbitrary terminals, and it does not control sessions that are not RC-enabled.
 
-`--stream` tails the local Claude Code transcript file, so it only works for sessions that exist on this machine. If you are targeting a session from another computer by RC URL, use `--reply`, `last-reply`, or `send+watch`.
+`--stream` tails the local Claude Code transcript file when this machine has one. If no local transcript is available, it falls back to Remote Control watch instead of failing the send.
 
-Watch streams state and summaries, not token-by-token assistant text. For the full response text, use `--reply` or `last-reply`.
+`last-reply` defaults to `--source auto`: local transcript first when available, then the RC events API. Use `--source api` to force the cloud events path, or `--source local` when you specifically want the local transcript and would rather fail than fall back.
+
+`--timeout` is a ceiling, not a sleep. Blocking commands return as soon as the expected acknowledgement, reply, or stream completion arrives; if it does not arrive before the timeout, the command exits nonzero. The default send/watch timeout is 120 seconds. Override per command with `--timeout N`, or set `CLAUDE_RC_TIMEOUT`, `CLAUDE_RC_SEND_TIMEOUT`, `CLAUDE_RC_WATCH_TIMEOUT`, or `CLAUDE_RC_STREAM_TIMEOUT`.
+
+Watch streams state and summaries, not token-by-token assistant text. For full response text, use `--reply` or `last-reply`.
 
 Chrome account mismatches matter. If Claude Code created the session under one Claude account but Chrome is logged into another, the local registry can still show a session while the cloud API returns `404`. `doctor` verifies the current Chrome cookie, but the fix is to switch Chrome back to the account that owns the session.
 

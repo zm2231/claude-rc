@@ -25,7 +25,6 @@ os.environ.setdefault("LOGFIRE_LOG_LEVEL", "ERROR")
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -55,7 +54,6 @@ COOKIE_BRIDGE = Path(
 PROFILE = os.environ.get("CLAUDE_COOKIE_PROFILE", "Default")
 IMPERSONATE = os.environ.get("RC_IMPERSONATE", "chrome")
 BASE = "https://claude.ai/v1/code/sessions"
-BASE_SESSION = "https://claude.ai/v1/code/session"  # singular variants exist
 
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -68,6 +66,22 @@ ANTHROPIC_HEADERS = {
     "anthropic-client-feature": "ccr",
     "anthropic-client-version": "1.0.0",
 }
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        die(f"{name} must be a number, got {raw!r}", code=2)
+
+
+DEFAULT_TIMEOUT = env_float("CLAUDE_RC_TIMEOUT", 120.0)
+DEFAULT_SEND_TIMEOUT = env_float("CLAUDE_RC_SEND_TIMEOUT", DEFAULT_TIMEOUT)
+DEFAULT_WATCH_TIMEOUT = env_float("CLAUDE_RC_WATCH_TIMEOUT", DEFAULT_TIMEOUT)
+DEFAULT_STREAM_TIMEOUT = env_float("CLAUDE_RC_STREAM_TIMEOUT", 600.0)
 
 
 def die(msg: str, code: int = 1) -> "NoReturn":
@@ -162,12 +176,28 @@ def transcript_path(session: dict) -> str | None:
     return None
 
 
+def target_capability(session: dict) -> dict:
+    transcript = transcript_path(session) if not session.get("_url") else None
+    has_transcript = bool(transcript and Path(transcript).exists())
+    return {
+        "transcript": transcript,
+        "hasLocalTranscript": has_transcript,
+        "replySource": "transcript" if has_transcript else "api",
+        "streamSource": "transcript" if has_transcript else "watch",
+        "remoteOnly": not has_transcript,
+    }
+
+
 def resolve_target(raw: str) -> dict:
     """Resolve a target spec to a single session record."""
     m = re.match(r"^https://claude\.ai/code/(session_[A-Za-z0-9]+)", raw)
     if m:
+        bridge_id = m.group(1)
+        for s in load_registry():
+            if s.get("bridgeSessionId") == bridge_id:
+                return s
         return {
-            "bridgeSessionId": m.group(1),
+            "bridgeSessionId": bridge_id,
             "sessionId": None,
             "cwd": None,
             "_url": True,
@@ -342,6 +372,74 @@ def extract_text(event: dict) -> tuple[str, str]:
     return role, "\n".join(parts)
 
 
+def extract_assistant_text_record(rec: dict) -> str:
+    """Return assistant text from one local transcript JSONL record."""
+    if rec.get("type") != "assistant":
+        return ""
+    msg = rec.get("message") or {}
+    if msg.get("role") not in (None, "assistant"):
+        return ""
+    content = msg.get("content")
+    parts = []
+    if isinstance(content, str) and content.strip():
+        parts.append(content)
+    elif isinstance(content, list):
+        for c in content:
+            if (
+                isinstance(c, dict)
+                and c.get("type") == "text"
+                and c.get("text", "").strip()
+            ):
+                parts.append(c["text"])
+    return "\n".join(parts).strip()
+
+
+def transcript_assistant_reply(
+    transcript: str,
+    after_uuid: str | None = None,
+    timeout: float = 0.0,
+) -> dict | None:
+    """Find assistant text in a local transcript, optionally after a user turn."""
+    path = Path(transcript)
+    deadline = time.time() + timeout
+    while True:
+        try:
+            lines = path.read_text("utf8", errors="replace").splitlines()
+        except Exception:
+            lines = []
+
+        start = 0
+        if after_uuid:
+            start = -1
+            compact = f'"uuid":"{after_uuid}"'
+            spaced = f'"uuid": "{after_uuid}"'
+            for i, line in enumerate(lines):
+                if compact in line or spaced in line:
+                    start = i + 1
+                    break
+
+        if start >= 0:
+            latest = None
+            for line in lines[start:]:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                text = extract_assistant_text_record(rec)
+                if text:
+                    latest = {
+                        "uuid": rec.get("uuid"),
+                        "text": text,
+                        "source": "transcript",
+                    }
+            if latest:
+                return latest
+
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.4)
+
+
 def http_watch(cookie: str, resume_token: str, on_event, idle_timeout_s: float = 120.0):
     """Open the SSE watch stream. Calls on_event(event, data) for each event.
     Streams until idle_timeout_s passes with no new event."""
@@ -428,13 +526,14 @@ def cmd_list(args):
 def cmd_resolve(args):
     s = resolve_target(args.target)
     cse = to_cse(s["bridgeSessionId"])
+    cap = target_capability(s)
     out = {
         "rcUrl": f"https://claude.ai/code/{s['bridgeSessionId']}",
         "cseId": cse,
         "localSession": s.get("sessionId"),
         "pid": s.get("pid"),
         "cwd": s.get("cwd"),
-        "transcript": transcript_path(s) if not s.get("_url") else None,
+        **cap,
     }
     print(json.dumps(out, indent=2) if args.json else out["rcUrl"])
 
@@ -443,6 +542,8 @@ def _send_and_maybe_watch(args, watch: bool):
     s = resolve_target(args.target)
     cse = to_cse(s["bridgeSessionId"])
     cookie = load_cookie_header()
+    cap = target_capability(s)
+    transcript = cap["transcript"]
     if args.dry_run:
         out = {
             "resolved": {
@@ -451,7 +552,7 @@ def _send_and_maybe_watch(args, watch: bool):
                 "localSession": s.get("sessionId"),
                 "pid": s.get("pid"),
                 "cwd": s.get("cwd"),
-                "transcript": transcript_path(s) if not s.get("_url") else None,
+                **cap,
             },
             "cookieLoaded": True,
             "wouldSend": args.message[:80],
@@ -463,18 +564,25 @@ def _send_and_maybe_watch(args, watch: bool):
 
     # --stream: tail the local transcript live (local sessions only).
     if getattr(args, "stream", False):
-        transcript = transcript_path(s) if not s.get("_url") else None
-        if not transcript or not Path(transcript).exists():
-            die("--stream requires a local transcript (target has no local session)")
-        print(f"sent (uuid {sent['uuid']}); streaming transcript:\n", flush=True)
-        res = stream_transcript(
-            transcript, sent["uuid"], args.timeout, json_out=args.json
-        )
-        if not res["completed"]:
+        if not cap["hasLocalTranscript"]:
             print(
-                f"\n[stream ended without end_turn within {args.timeout}s]", flush=True
+                "--stream needs a local transcript; falling back to RC watch",
+                file=sys.stderr,
+                flush=True,
             )
-        return
+            watch = True
+        else:
+            print(f"sent (uuid {sent['uuid']}); streaming transcript:\n", flush=True)
+            res = stream_transcript(
+                transcript, sent["uuid"], args.timeout, json_out=args.json
+            )
+            if not res["completed"]:
+                print(
+                    f"\n[stream ended without end_turn within {args.timeout}s]",
+                    flush=True,
+                )
+                sys.exit(1)
+            return
 
     if not watch and not args.wait_ack and not args.json:
         print(
@@ -483,7 +591,6 @@ def _send_and_maybe_watch(args, watch: bool):
         return
 
     # ack verification: prefer transcript (local), else watch stream.
-    transcript = transcript_path(s) if not s.get("_url") else None
     ack = None
     if args.wait_ack and transcript and Path(transcript).exists():
         ack = wait_ack_transcript(transcript, sent["uuid"], args.wait_ack, args.timeout)
@@ -502,16 +609,18 @@ def _send_and_maybe_watch(args, watch: bool):
             ack = wait_ack_watch(cookie, sent["uuid"], None, min(args.timeout, 20))
             via = "watch"
 
+    ack_ok = bool(ack and ack.get("acked"))
+    blocking_ack_required = bool(watch or args.wait_ack)
     if args.json:
         print(
             json.dumps(
                 {
-                    "ok": True,
+                    "ok": (ack_ok or not blocking_ack_required),
                     "sentUuid": sent["uuid"],
                     "rcUrl": f"https://claude.ai/code/{s['bridgeSessionId']}",
                     "cseId": cse,
                     "localSession": s.get("sessionId"),
-                    "transcript": transcript,
+                    **cap,
                     "eventResponse": sent.get("eventResponse"),
                     "ackVia": via,
                     "ack": ack,
@@ -527,29 +636,62 @@ def _send_and_maybe_watch(args, watch: bool):
             extra = " | ack matched"
         print(f"sent + acked via {via} (uuid {sent['uuid']}){extra}")
 
+    if blocking_ack_required and not ack_ok:
+        die(
+            f"timed out after {args.timeout:g}s waiting for ack via {via} "
+            f"(uuid {sent['uuid']})",
+            code=1,
+        )
+
     # --reply: after ack, fetch the assistant reply text for this turn.
     if getattr(args, "reply", False):
+        if transcript and Path(transcript).exists():
+            reply = transcript_assistant_reply(
+                transcript, after_uuid=sent["uuid"], timeout=args.timeout
+            )
+            if reply:
+                if args.json:
+                    print(json.dumps({"reply": reply}, ensure_ascii=False, indent=2))
+                else:
+                    print("\n=== reply ===")
+                    print(reply["text"])
+                return
+            die(
+                f"timed out after {args.timeout:g}s waiting for transcript reply "
+                f"(uuid {sent['uuid']})",
+                code=1,
+            )
         try:
-            events = http_fetch_events(cookie, s["bridgeSessionId"], limit=80)
-            # events newer than our sent uuid
-            start = None
-            for i, e in enumerate(events):
-                if e.get("uuid") == sent["uuid"]:
-                    start = i + 1
-                    break
-            tail = events[start:] if start is not None else events[-12:]
+            tail = http_fetch_events(
+                cookie, s["bridgeSessionId"], limit=80, after_uuid=sent["uuid"]
+            )
             printed = False
             for e in reversed(tail):
                 role, text = extract_text(e)
                 if role == "assistant" and text and not text.startswith("["):
-                    print("\n=== reply ===")
-                    print(text)
+                    if args.json:
+                        print(
+                            json.dumps(
+                                {
+                                    "reply": {
+                                        "uuid": e.get("uuid"),
+                                        "text": text,
+                                        "source": "api",
+                                    }
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            )
+                        )
+                    else:
+                        print("\n=== reply ===")
+                        print(text)
                     printed = True
                     break
             if not printed:
-                print("\n(no assistant text reply found yet)", file=sys.stderr)
+                die("no assistant text reply found in RC events API", code=1)
         except Exception as e:
-            print(f"\n(reply fetch failed: {e})", file=sys.stderr)
+            die(f"reply fetch failed: {e}", code=1)
 
 
 def wait_ack_transcript(
@@ -927,10 +1069,24 @@ def cmd_doctor(args):
 
 
 def cmd_last_reply(args):
-    """Fetch the most recent assistant reply (full text) for a session via API.
-    Works for local OR remote sessions (transcript-free)."""
+    """Fetch the most recent assistant reply (full text) for a session."""
     s = resolve_target(args.target)
     sid = s["bridgeSessionId"]
+
+    transcript = transcript_path(s) if not s.get("_url") else None
+    if args.source in ("auto", "local") and transcript and Path(transcript).exists():
+        reply = transcript_assistant_reply(transcript)
+        if reply:
+            if args.json:
+                print(json.dumps(reply, ensure_ascii=False, indent=2))
+            else:
+                print(reply["text"])
+            return
+        if args.source == "local":
+            die("no assistant text reply found in local transcript")
+    elif args.source == "local":
+        die(f"no local transcript for target: {transcript}")
+
     cookie = load_cookie_header()
     events = http_fetch_events(cookie, sid, limit=args.limit)
     # walk backward for the last assistant text event
@@ -940,7 +1096,7 @@ def cmd_last_reply(args):
             if args.json:
                 print(
                     json.dumps(
-                        {"uuid": e.get("uuid"), "text": text},
+                        {"uuid": e.get("uuid"), "text": text, "source": "api"},
                         ensure_ascii=False,
                         indent=2,
                     )
@@ -972,7 +1128,12 @@ def main():
     sp.add_argument("target")
     sp.add_argument("message")
     sp.add_argument("--wait-ack", default=None, nargs="?", const=".*")
-    sp.add_argument("--timeout", type=float, default=30.0)
+    sp.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_SEND_TIMEOUT,
+        help=f"seconds to wait for ack/reply/stream work (default: {DEFAULT_SEND_TIMEOUT:g}; env: CLAUDE_RC_TIMEOUT or CLAUDE_RC_SEND_TIMEOUT)",
+    )
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument(
         "--stream",
@@ -992,7 +1153,12 @@ def main():
     sw.add_argument("target")
     sw.add_argument("message")
     sw.add_argument("--wait-ack", default=None, nargs="?", const=".*")
-    sw.add_argument("--timeout", type=float, default=120.0)
+    sw.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_WATCH_TIMEOUT,
+        help=f"seconds to watch for completion (default: {DEFAULT_WATCH_TIMEOUT:g}; env: CLAUDE_RC_TIMEOUT or CLAUDE_RC_WATCH_TIMEOUT)",
+    )
     sw.add_argument("--dry-run", action="store_true")
     sw.set_defaults(func=lambda a: _send_and_maybe_watch(a, watch=True))
 
@@ -1006,7 +1172,12 @@ def main():
         help="tail a session's local transcript live (no send)",
     )
     stp.add_argument("target")
-    stp.add_argument("--timeout", type=float, default=600.0)
+    stp.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_STREAM_TIMEOUT,
+        help=f"seconds to tail the local transcript (default: {DEFAULT_STREAM_TIMEOUT:g}; env: CLAUDE_RC_STREAM_TIMEOUT)",
+    )
     stp.set_defaults(func=cmd_stream)
 
     sub.add_parser(
@@ -1021,6 +1192,12 @@ def main():
     lr.add_argument("target")
     lr.add_argument(
         "--limit", type=int, default=50, help="how many recent events to scan"
+    )
+    lr.add_argument(
+        "--source",
+        choices=("auto", "local", "api"),
+        default="auto",
+        help="reply source: local transcript when available, otherwise API",
     )
     lr.set_defaults(func=cmd_last_reply)
 

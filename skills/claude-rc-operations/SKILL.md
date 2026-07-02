@@ -5,197 +5,124 @@ description: "Use when the user wants Codex to communicate with Claude Code sess
 
 # Claude RC Operations
 
-Use `claude-rc` when the user wants Codex to talk to a running Claude Code session.
+Use `claude-rc` when Codex should talk to an already-running Claude Code Remote Control session.
 
-The important thing to remember: you can send a normal user turn to Claude and get Claude's reply from the terminal. Do not say you cannot communicate with Claude until you have checked whether `claude-rc-send` is installed and healthy.
-
-## Prerequisite Check
-
-Start with:
+Do not say Codex cannot message Claude until you have checked the installed client:
 
 ```bash
 command -v claude-rc-send
 claude-rc-send doctor --json
 ```
 
-`doctor` should show:
+`doctor` should show cookie read and Cloudflare/list reachability as `ok: true`. If it fails with a 404 or session-not-found after local resolution succeeds, Chrome is often logged into a different Claude account than the target session.
 
-- cookie read: true
-- cloudflare / list: true
-- daemon socket: true or informational
+## Resolve First
 
-If `doctor` fails because Chrome is logged into the wrong Claude account, say that directly. Account mismatch is a common failure mode: a local Claude session can appear in the registry while the Claude web API returns `404` because Chrome is authenticated as a different Claude account.
-
-## List Sessions
-
-List the sessions Codex can target:
+List and resolve sessions before sending when the target is not exact:
 
 ```bash
 claude-rc-list
-```
-
-For structured parsing:
-
-```bash
 claude-rc-list --json
-```
-
-Use this before sending if the user gives a vague target like a repo name, session name, or cwd fragment.
-
-## Resolve a Target
-
-Resolve before sending when there is any ambiguity:
-
-```bash
 claude-rc-send resolve <target> --json
 ```
 
-Targets can be:
+Targets can be PID, local session id or prefix, `session_...`, RC URL, cwd fragment, or session-name fragment. If resolution is ambiguous, use the PID, local session id, or full RC session id.
 
-- PID
-- local Claude session id or prefix
-- RC `session_...` id
-- RC URL
-- unique cwd or session-name fragment
+Use `resolve --json` routing fields:
 
-If resolution returns multiple matches, ask the user which one to use or choose the exact PID/session id if the user already supplied it.
+- `hasLocalTranscript: true`: transcript-backed `--reply`, `--stream`, and `last-reply --source local` are available.
+- `replySource: transcript|api`: what auto reply mode will prefer.
+- `streamSource: transcript|watch`: whether `--stream` will tail local transcript or fall back to RC watch.
+- `remoteOnly: true`: this client cannot read a local transcript for the target.
 
-## Send a Message and Get Claude's Reply
+Local sessions can wait on the JSONL transcript and return fresh full text. Remote-only/API sessions can send and watch RC state, but may not have fresh full text until cloud events catch up.
 
-Default pattern:
+## Send Defaults
+
+Default to blocking mode so Codex waits for Claude instead of sending and moving on:
 
 ```bash
 claude-rc-send <target> "message" --wait-ack --reply
 ```
 
-This sends a user turn, waits for transcript acknowledgement when possible, and fetches the assistant reply text.
+Use transcript streaming for local sessions when tool calls or live progress matter:
 
-If the user only wants to send a message and does not need the reply:
+```bash
+claude-rc-send <target> "message" --wait-ack --stream
+```
+
+Use plain send only when the user explicitly wants fire-and-forget:
 
 ```bash
 claude-rc-send <target> "message" --wait-ack
 ```
 
-If the user asks "what did Claude say?" after a send:
-
-```bash
-claude-rc-send last-reply <target>
-```
-
-## Streaming and Watching
-
-For local sessions on this machine, `--stream` tails the Claude transcript:
-
-```bash
-claude-rc-send <target> "message" --stream --timeout 120
-```
-
-Use this when the user wants to see tool calls, tool results, or final text as they appear in the local transcript.
-
-For remote/no-transcript sessions, use watch or reply fetching:
-
-```bash
-claude-rc-send send+watch <target> "message" --timeout 120
-claude-rc-send <target> "message" --wait-ack --reply
-```
-
-Watch streams worker state and summaries, not token-by-token assistant text. Use `--reply` or `last-reply` for full text.
-
-## Dry Run Before Risky Sends
-
-Use dry-run when the target is unclear or the message has side effects:
+For unclear or risky targets, dry-run first:
 
 ```bash
 claude-rc-send <target> "message" --dry-run --json
 ```
 
-Dry-run resolves the target and loads cookies but does not send.
+## Reply And Timeout Behavior
 
-## Operational Defaults
+`--timeout` is a ceiling, not a sleep. Commands return as soon as the expected acknowledgement, reply, or `end_turn` arrives. If the expected event does not arrive before the timeout, the command exits nonzero.
 
-- Prefer the default Python backend.
-- Use `--via-surf` only if the Python backend is blocked by Cloudflare and the user wants browser UI fallback.
-- Use `--via-node` only for legacy list/resolve/send behavior.
-- Do not use tmux, AppleScript, keyboard typing, or terminal injection when `claude-rc` can target the session directly.
+Use the right primitive:
+
+- Need to send a message and wait for the answer: `claude-rc-send <target> "message" --wait-ack --reply --timeout 300`.
+- Need to send a message and watch local tool activity live: `claude-rc-send <target> "message" --wait-ack --stream --timeout 300`.
+- Message was already sent and the target is local: `claude-rc-send stream <target> --timeout 300`.
+- Message was already sent and the target is remote-only: `claude-rc-send watch <target>` for state, then `claude-rc-send last-reply <target>` to fetch whatever text cloud events currently expose.
+
+`last-reply` is not a wait primitive. It fetches the latest available assistant text immediately and does not take `--timeout`.
+
+Defaults:
+
+- send/watch timeout: 120 seconds
+- transcript tail timeout: 600 seconds
+
+Override with `--timeout N` or environment variables:
+
+- `CLAUDE_RC_TIMEOUT`
+- `CLAUDE_RC_SEND_TIMEOUT`
+- `CLAUDE_RC_WATCH_TIMEOUT`
+- `CLAUDE_RC_STREAM_TIMEOUT`
+
+For long implementation/review tasks, use `--timeout 300` or `--timeout 600`.
+
+Streaming shows transcript-visible events only: queued status, tool calls, tool results, assistant text, and end turn. It does not show hidden thinking tokens, so silence can be normal while Claude is thinking.
+
+## Fetch Existing Replies
+
+Use:
+
+```bash
+claude-rc-send last-reply <target>
+```
+
+`last-reply` defaults to `--source auto`: local transcript first when available, then RC events API. It returns immediately. If freshness matters for a local session, force:
+
+```bash
+claude-rc-send last-reply <target> --source local
+```
+
+Use `--source api` only to inspect cloud events behavior or for targets without local transcripts.
+
+## Fallbacks And Failures
+
+- `--stream` falls back to RC watch when no local transcript is available. Watch gives worker state and summaries, not full token text.
+- `--reply` uses local transcript after the sent UUID when possible, then API fallback for no-transcript targets.
+- Cloud events can be stale compared with local transcript; prefer transcript-backed paths for local sessions.
+- Do not use tmux, AppleScript, keyboard typing, or terminal injection when `claude-rc` can address the session directly.
 - Do not read or print raw cookies. `doctor` is safe; cookie values are not needed.
 
-## Common Workflows
+If Cloudflare blocks the Python backend, ask the user to open `https://claude.ai` in Chrome and let Cloudflare resolve. Use `--via-surf` only as an explicit browser UI fallback for send/resolve. Use `--via-node` only for legacy list/resolve/send checks.
 
-### Ask Claude a question
+## Required Response Pattern
 
-```bash
-claude-rc-send <target> "Question for Claude..." --wait-ack --reply
-```
-
-Then summarize the reply to the user.
-
-### Delegate work to Claude
-
-```bash
-claude-rc-send <target> "Please investigate X and report findings. Do not modify files." --wait-ack
-```
-
-If the user asks for the result later:
-
-```bash
-claude-rc-send last-reply <target>
-```
-
-### Check whether a session can be addressed
-
-```bash
-claude-rc-send resolve <target> --json
-claude-rc-send <target> "ping" --dry-run --json
-```
-
-Use a real send only after the user confirms the target or the target is unambiguous.
-
-## Failure Modes
-
-### `session not found` or HTTP 404
-
-Most likely causes:
-
-- Chrome is signed into a different Claude account than the target Claude Code session.
-- Remote Control is not enabled for that session.
-- The local session registry has stale RC metadata.
-
-Run:
-
-```bash
-claude-rc-send doctor --json
-claude-rc-send resolve <target> --json
-claude-rc-list
-```
-
-Then tell the user what differs: account, target, registry, or cloud reachability.
-
-### `--stream requires a local transcript`
-
-The target is not local to this machine, or the transcript path is missing. Use:
-
-```bash
-claude-rc-send <target> "message" --wait-ack --reply
-claude-rc-send last-reply <target>
-```
-
-### Cloudflare challenge
-
-Ask the user to open `https://claude.ai` in Chrome and let Cloudflare resolve. Then retry `doctor`.
-
-If direct Python remains blocked and `surf-cli` is installed:
-
-```bash
-claude-rc-send --via-surf <target> "message"
-```
-
-## Response Handling
-
-When the user asks you to "message Claude and tell me what it says," do all of it:
+When the user asks you to message Claude and report back:
 
 1. Run `doctor`.
 2. Resolve the target.
-3. Send with `--wait-ack --reply`.
-4. Report Claude's response in your final answer.
-
-Do not make the user manually run `last-reply` unless a command fails or the session is still working.
+3. Send with `--wait-ack --reply` or `--wait-ack --stream`.
+4. Report Claude's response or the exact failure mode.
