@@ -1,0 +1,8 @@
+interface:
+  display_name: "Claude RC Operations"
+  short_description: "Message Claude Code sessions from Codex"
+  brand_color: "#6B5BFF"
+  default_prompt: "Use $claude-rc-operations to send a message to a running Claude Code session and report the reply."
+
+policy:
+  allow_implicit_invocation: true
